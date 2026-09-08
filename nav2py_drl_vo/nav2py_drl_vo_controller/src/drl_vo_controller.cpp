@@ -1,592 +1,570 @@
 /*
  * SPDX-License-Identifier: BSD-3-Clause
- *
- * Template Controller for nav2py
  */
 
-#include <algorithm>
-#include <string>
-#include <memory>
-
-#include "nav2_core/exceptions.hpp"
-#include "nav2_util/node_utils.hpp"
 #include "nav2py_drl_vo_controller/drl_vo_controller.hpp"
-#include "nav2_util/geometry_utils.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+#include "ament_index_cpp/get_package_prefix.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
+#include "nav2_core/exceptions.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/footprint_collision_checker.hpp"
+#include "nav2_util/geometry_utils.hpp"
+#include "nav2_util/node_utils.hpp"
+#include "pluginlib/class_list_macros.hpp"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-using std::hypot;
-using std::min;
-using std::max;
-using std::abs;
-using nav2_util::declare_parameter_if_not_declared;
-using nav2_util::geometry_utils::euclidean_distance;
+#include "nav2py_drl_vo_controller/scan_preprocessor.hpp"
 
-#define NUM_TP 10
- 
 namespace nav2py_drl_vo_controller
 {
+namespace
+{
 
-  /**
-    * Find element in iterator with the minimum calculated value
-    */
-  template<typename Iter, typename Getter>
-  Iter min_by(Iter begin, Iter end, Getter getCompareVal)
-  {
-    if (begin == end) {
-      return end;
-    }
-    auto lowest = getCompareVal(*begin);
-    Iter lowest_it = begin;
-    for (Iter it = ++begin; it != end; ++it) {
-      auto comp = getCompareVal(*it);
-      if (comp < lowest) {
-        lowest = comp;
-        lowest_it = it;
-      }
-    }
-    return lowest_it;
+constexpr std::size_t kScanHistoryFrames = 10U;
+constexpr std::size_t kModelScanSamples = 720U;
+constexpr std::size_t kPedestrianMapSize = 2U * 80U * 80U;
+
+template<typename Iterator, typename Getter>
+Iterator min_by(Iterator begin, Iterator end, Getter getter)
+{
+  if (begin == end) {
+    return end;
   }
+  auto lowest_value = getter(*begin);
+  auto lowest = begin;
+  for (auto current = std::next(begin); current != end; ++current) {
+    const auto value = getter(*current);
+    if (value < lowest_value) {
+      lowest_value = value;
+      lowest = current;
+    }
+  }
+  return lowest;
+}
 
-  void DrlVoController::configure(
-    const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
-    std::string name, const std::shared_ptr<tf2_ros::Buffer> tf,
-    const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
+std::string shell_quote(const std::string & value)
+{
+  std::string quoted{"'"};
+  for (const char character : value) {
+    if (character == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += character;
+    }
+  }
+  quoted += '\'';
+  return quoted;
+}
+
+std::string base64_encode(const std::vector<uint8_t> & bytes)
+{
+  static constexpr char alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string output;
+  output.reserve(4U * ((bytes.size() + 2U) / 3U));
+  for (std::size_t index = 0; index < bytes.size(); index += 3U) {
+    const uint32_t first = bytes[index];
+    const uint32_t second = index + 1U < bytes.size() ? bytes[index + 1U] : 0U;
+    const uint32_t third = index + 2U < bytes.size() ? bytes[index + 2U] : 0U;
+    const uint32_t value = (first << 16U) | (second << 8U) | third;
+    output.push_back(alphabet[(value >> 18U) & 0x3fU]);
+    output.push_back(alphabet[(value >> 12U) & 0x3fU]);
+    output.push_back(index + 1U < bytes.size() ? alphabet[(value >> 6U) & 0x3fU] : '=');
+    output.push_back(index + 2U < bytes.size() ? alphabet[value & 0x3fU] : '=');
+  }
+  return output;
+}
+
+std::string numeric_array_payload(const std::vector<float> & values)
+{
+  // Use an explicit big-endian IEEE-754 representation so the Python decoder
+  // does not depend on CPU byte order.
+  std::vector<uint8_t> bytes;
+  bytes.reserve(values.size() * sizeof(float));
+  for (const float value : values) {
+    uint32_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    bytes.push_back(static_cast<uint8_t>((bits >> 24U) & 0xffU));
+    bytes.push_back(static_cast<uint8_t>((bits >> 16U) & 0xffU));
+    bytes.push_back(static_cast<uint8_t>((bits >> 8U) & 0xffU));
+    bytes.push_back(static_cast<uint8_t>(bits & 0xffU));
+  }
+  return "b64f32be:" + base64_encode(bytes);
+}
+
+}  // namespace
+
+void DrlVoController::configure(
+  const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
+  std::string name,
+  const std::shared_ptr<tf2_ros::Buffer> tf,
+  const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
+{
+  node_ = parent;
+  const auto node = node_.lock();
+  if (!node) {
+    throw nav2_core::PlannerException("DRL-VO controller node expired during configure");
+  }
+  tf_ = tf;
+  costmap_ros_ = costmap_ros;
+  plugin_name_ = std::move(name);
+  logger_ = node->get_logger();
+  clock_ = node->get_clock();
+
+  const auto declare = [&node, this](const std::string & parameter, const auto & value) {
+      nav2_util::declare_parameter_if_not_declared(
+        node, plugin_name_ + "." + parameter, rclcpp::ParameterValue(value));
+    };
+  declare("lookahead_dist", 2.0);
+  declare("transform_tolerance", 0.1);
+  declare("scan_topic", std::string("/scan"));
+  declare("scan_timeout", 0.5);
+  declare("pedestrian_map_topic", std::string("/drl_vo/pedestrian_velocity_map"));
+  declare("pedestrian_timeout", 0.5);
+  declare("require_pedestrian_data", true);
+  declare("command_timeout", 0.2);
+  declare("model_file", std::string());
+  declare("range_limit", 30.0);
+  declare("model_scan_angle_min", -2.09439510239);
+  declare("model_scan_angle_max", 2.09439510239);
+  declare("max_linear_speed", 0.5);
+  declare("max_angular_speed", 0.7);
+  declare("min_obstacle_distance", 0.45);
+  declare("collision_check_horizon", 1.0);
+  declare("collision_check_step", 0.05);
+
+  std::string scan_topic;
+  std::string pedestrian_map_topic;
+  std::string model_file;
+  node->get_parameter(plugin_name_ + ".lookahead_dist", lookahead_distance_);
+  node->get_parameter(plugin_name_ + ".transform_tolerance", transform_tolerance_seconds_);
+  node->get_parameter(plugin_name_ + ".scan_topic", scan_topic);
+  node->get_parameter(plugin_name_ + ".scan_timeout", scan_timeout_seconds_);
+  node->get_parameter(plugin_name_ + ".pedestrian_map_topic", pedestrian_map_topic);
+  node->get_parameter(plugin_name_ + ".pedestrian_timeout", pedestrian_timeout_seconds_);
+  node->get_parameter(plugin_name_ + ".require_pedestrian_data", require_pedestrian_data_);
+  node->get_parameter(plugin_name_ + ".command_timeout", command_timeout_seconds_);
+  node->get_parameter(plugin_name_ + ".model_file", model_file);
+  node->get_parameter(plugin_name_ + ".range_limit", range_limit_);
+  node->get_parameter(plugin_name_ + ".model_scan_angle_min", model_scan_angle_min_);
+  node->get_parameter(plugin_name_ + ".model_scan_angle_max", model_scan_angle_max_);
+  node->get_parameter(plugin_name_ + ".max_linear_speed", max_linear_speed_);
+  node->get_parameter(plugin_name_ + ".max_angular_speed", max_angular_speed_);
+  node->get_parameter(plugin_name_ + ".min_obstacle_distance", min_obstacle_distance_);
+  node->get_parameter(plugin_name_ + ".collision_check_horizon", collision_check_horizon_);
+  node->get_parameter(plugin_name_ + ".collision_check_step", collision_check_step_);
+
+  if (lookahead_distance_ <= 0.0 || scan_timeout_seconds_ <= 0.0 ||
+    pedestrian_timeout_seconds_ <= 0.0 || command_timeout_seconds_ <= 0.0 ||
+    range_limit_ <= 0.0 || max_linear_speed_ <= 0.0 || max_angular_speed_ <= 0.0 ||
+    collision_check_horizon_ <= 0.0 || collision_check_step_ <= 0.0)
   {
-    node_ = parent;
-  
-    auto node = node_.lock();
-  
-    costmap_ros_ = costmap_ros;
-    tf_ = tf;
-    plugin_name_ = name;
-    logger_ = node->get_logger();
-    clock_ = node->get_clock();
+    throw nav2_core::PlannerException("DRL-VO controller parameters must be positive");
+  }
+  active_linear_speed_limit_ = max_linear_speed_;
+  pedestrian_map_.assign(kPedestrianMapSize, 0.0F);
 
-    declare_parameter_if_not_declared(
-      node, plugin_name_ + ".lookahead_dist",
-      rclcpp::ParameterValue(1.0));
-    declare_parameter_if_not_declared(
-      node, plugin_name_ + ".transform_tolerance", rclcpp::ParameterValue(
-        0.1));
+  if (model_file.empty()) {
+    model_file = ament_index_cpp::get_package_share_directory(
+      "nav2py_drl_vo_controller") + "/model/drl_vo.zip";
+  }
+  const std::string executable = ament_index_cpp::get_package_prefix(
+    "nav2py_drl_vo_controller") + "/lib/nav2py_drl_vo_controller/nav2py_run";
+  std::ostringstream command;
+  command << shell_quote(executable) << " --host 127.0.0.1 --port 0"
+          << " --model-file " << shell_quote(model_file)
+          << " --range-limit " << range_limit_
+          << " --vx-limit " << max_linear_speed_
+          << " --wz-limit " << max_angular_speed_
+          << " --min-obstacle-distance " << min_obstacle_distance_;
+  nav2py_bootstrap(command.str());
 
-    node->get_parameter(plugin_name_ + ".lookahead_dist", lookahead_dist_);
-    double transform_tolerance;
-    node->get_parameter(plugin_name_ + ".transform_tolerance", transform_tolerance);
-    transform_tolerance_ = rclcpp::Duration::from_seconds(transform_tolerance);
-    
-    // Initialize nav2py
-    std::string nav2py_script = ament_index_cpp::get_package_share_directory("nav2py_drl_vo_controller") + "/../../lib/nav2py_drl_vo_controller/nav2py_run" ;
-    nav2py_bootstrap(nav2py_script +
-      " --host 127.0.0.1" +
-      " --port 0");
-  
-    // Create publisher for global plan
-    global_pub_ = node->create_publisher<nav_msgs::msg::Path>("received_global_plan", 1);
-    
-    // Create scan subscriber:
-    // Subscribe to new topics
-    scan_sub_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
-        "scan", 20,
-        std::bind(&DrlVoController::scanCallback, this, std::placeholders::_1));
+  global_plan_publisher_ = node->create_publisher<nav_msgs::msg::Path>(
+    "received_global_plan", 1);
+  scan_subscription_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
+    scan_topic, rclcpp::SensorDataQoS(),
+    std::bind(&DrlVoController::scanCallback, this, std::placeholders::_1));
+  pedestrian_map_subscription_ =
+    node->create_subscription<std_msgs::msg::Float32MultiArray>(
+    pedestrian_map_topic, rclcpp::SensorDataQoS(),
+    std::bind(&DrlVoController::pedestrianMapCallback, this, std::placeholders::_1));
 
-    // Create scan history publisher and subscriber:
-    scan_history_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>("scan_history_list", 1);
-    scan_history_sub_ = node->create_subscription<std_msgs::msg::Float32MultiArray>(
-        "scan_history_list", 20,
-        std::bind(&DrlVoController::scanHistoryCallback, this, std::placeholders::_1));
-
-
-    // Create a timer to call the callback function every 1/20 seconds
-    timer_ = node->create_wall_timer(
-        std::chrono::milliseconds(50), 
-        std::bind(&DrlVoController::timerCallback, this));
-
-
-    RCLCPP_INFO(
+  RCLCPP_INFO(
+    logger_, "Configured %s with checkpoint %s", plugin_name_.c_str(),
+    model_file.c_str());
+  if (!require_pedestrian_data_) {
+    RCLCPP_WARN(
       logger_,
-      "Configured controller: %s of type nav2py_drl_vo_controller::DrlVoController",
-      plugin_name_.c_str());
+      "Pedestrian data is optional: this is a lidar-only DRL-VO ablation, not the social policy");
   }
- 
-  void DrlVoController::sendData(
-    const geometry_msgs::msg::PoseStamped & pose,
-    const geometry_msgs::msg::Twist & velocity,
-    const geometry_msgs::msg::PoseStamped & goal_pose)
-  {
-    static int frame_count = 0;
-    frame_count++;
+}
 
-    // Add frame delimiter for logs
-    std::string frame_delimiter(50, '=');
-    RCLCPP_INFO(logger_, "\n%s", frame_delimiter.c_str());
-    RCLCPP_INFO(logger_, "===== SENDING FRAME %d =====", frame_count);
+void DrlVoController::cleanup()
+{
+  nav2py_cleanup();
+  global_plan_publisher_.reset();
+  scan_subscription_.reset();
+  pedestrian_map_subscription_.reset();
+  std::scoped_lock lock(sensor_mutex_, plan_mutex_);
+  current_scan_.clear();
+  scan_history_.clear();
+  global_plan_.poses.clear();
+  scan_generation_ = 0U;
+  pedestrian_map_generation_ = 0U;
+  sent_scan_generation_ = 0U;
+  sent_pedestrian_map_generation_ = 0U;
+}
 
-    // Create a structured data message
-    std::stringstream ss;
-    ss << "frame_info:\n";
-    ss << "  id: " << frame_count << "\n";
-    ss << "  timestamp: " << clock_->now().nanoseconds() << "\n";
+void DrlVoController::activate()
+{
+  global_plan_publisher_->on_activate();
+}
 
-    // Add robot pose
-    ss << "robot_pose:\n";
-    ss << "  position:\n";
-    ss << "    x: " << pose.pose.position.x << "\n";
-    ss << "    y: " << pose.pose.position.y << "\n";
-    ss << "    z: " << pose.pose.position.z << "\n";
-    ss << "  orientation:\n";
-    ss << "    x: " << pose.pose.orientation.x << "\n";
-    ss << "    y: " << pose.pose.orientation.y << "\n";
-    ss << "    z: " << pose.pose.orientation.z << "\n";
-    ss << "    w: " << pose.pose.orientation.w << "\n";
+void DrlVoController::deactivate()
+{
+  global_plan_publisher_->on_deactivate();
+}
 
-    // Add robot velocity
-    ss << "robot_velocity:\n";
-    ss << "  linear:\n";
-    ss << "    x: " << velocity.linear.x << "\n";
-    ss << "    y: " << velocity.linear.y << "\n";
-    ss << "    z: " << velocity.linear.z << "\n";
-    ss << "  angular:\n";
-    ss << "    x: " << velocity.angular.x << "\n";
-    ss << "    y: " << velocity.angular.y << "\n";
-    ss << "    z: " << velocity.angular.z << "\n";
-
-    // Add goal pose
-    ss << "goal_pose:\n";
-    ss << "  position:\n";
-    ss << "    x: " << goal_pose.pose.position.x << "\n";
-    ss << "    y: " << goal_pose.pose.position.y << "\n";
-    ss << "    z: " << goal_pose.pose.position.z << "\n";
-    // ss << "  orientation:\n";
-    // ss << "    x: " << goal_pose.pose.orientation.x << "\n";
-    // ss << "    y: " << goal_pose.pose.orientation.y << "\n";
-    // ss << "    z: " << goal_pose.pose.orientation.z << "\n";
-    // ss << "    w: " << goal_pose.pose.orientation.w << "\n";
-
-    // Send the data
-    nav2py_send("data", {ss.str()});
-
-    RCLCPP_INFO(logger_, "Data sent to Python side");
+void DrlVoController::setSpeedLimit(const double & speed_limit, const bool & percentage)
+{
+  if (speed_limit <= 0.0) {
+    active_linear_speed_limit_ = max_linear_speed_;
+  } else if (percentage) {
+    active_linear_speed_limit_ = max_linear_speed_ *
+      std::clamp(speed_limit, 0.0, 100.0) / 100.0;
+  } else {
+    active_linear_speed_limit_ = std::min(speed_limit, max_linear_speed_);
   }
- 
-  void DrlVoController::cleanup()
-  {
-    RCLCPP_INFO(
-      logger_,
-      "Cleaning up controller: %s",
-      plugin_name_.c_str());
-    nav2py_cleanup();
-    global_pub_.reset();
-    scan_history_pub_.reset();
-  }
-  
-  void DrlVoController::activate()
-  {
-    RCLCPP_INFO(
-      logger_,
-      "Activating controller: %s",
-      plugin_name_.c_str());
-    global_pub_->on_activate();
-    scan_history_pub_->on_activate();
-  }
-  
-  void DrlVoController::deactivate()
-  {
-    RCLCPP_INFO(
-      logger_,
-      "Deactivating controller: %s",
-      plugin_name_.c_str());
-    global_pub_->on_deactivate();
-    scan_history_pub_->on_deactivate();
-  }
+}
 
-  void DrlVoController::setSpeedLimit(const double& speed_limit, const bool& percentage)
-  {
-    // Empty implementation for interface compatibility
-    (void) speed_limit;
-    (void) percentage;
-  }
-
-  geometry_msgs::msg::TwistStamped DrlVoController::computeVelocityCommands(
-    const geometry_msgs::msg::PoseStamped & pose,
-    const geometry_msgs::msg::Twist & velocity,
-    nav2_core::GoalChecker * goal_checker)
-  {
-    (void)goal_checker;
-
-    // send path in robot's local frame:
-    auto transformed_plan = transformGlobalPlan(pose);
-    try {
-      std::string path_yaml = nav_msgs::msg::to_yaml(transformed_plan, true);
-      
-      nav2py_send("path", {path_yaml});
-      RCLCPP_INFO(logger_, "Sent path data to Python controller");
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(
-        logger_,
-        "Error sending path to Python controller: %s", e.what());
+void DrlVoController::scanCallback(
+  const sensor_msgs::msg::LaserScan::SharedPtr message)
+{
+  try {
+    auto processed = resample_scan(
+      *message, kModelScanSamples, model_scan_angle_min_, model_scan_angle_max_);
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
+    current_scan_ = processed;
+    scan_history_.push_back(std::move(processed));
+    while (scan_history_.size() > kScanHistoryFrames) {
+      scan_history_.pop_front();
     }
+    last_scan_received_ = clock_->now();
+    ++scan_generation_;
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR_THROTTLE(
+      logger_, *clock_, 2000, "Rejected /scan for DRL-VO: %s", error.what());
+  }
+}
 
-    // send lidar scan data:
-    try {
-      std::string scan_yaml = sensor_msgs::msg::to_yaml(scan_msg, true);
-      
-      nav2py_send("scan", {scan_yaml});
-      RCLCPP_INFO(logger_, "Sent scan data to Python controller");
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(
-        logger_,
-        "Error sending scan to Python controller: %s", e.what());
+void DrlVoController::pedestrianMapCallback(
+  const std_msgs::msg::Float32MultiArray::SharedPtr message)
+{
+  if (message->data.size() != kPedestrianMapSize ||
+    !std::all_of(
+      message->data.begin(), message->data.end(),
+      [](float value) {return std::isfinite(value);}))
+  {
+    RCLCPP_ERROR_THROTTLE(
+      logger_, *clock_, 2000,
+      "Rejected pedestrian velocity map: expected 12800 finite values");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(sensor_mutex_);
+  pedestrian_map_ = message->data;
+  last_pedestrian_map_received_ = clock_->now();
+  ++pedestrian_map_generation_;
+}
+
+geometry_msgs::msg::TwistStamped DrlVoController::computeVelocityCommands(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & velocity,
+  nav2_core::GoalChecker * goal_checker)
+{
+  (void)velocity;
+  (void)goal_checker;
+  const auto transformed_plan = transformGlobalPlan(pose);
+  const auto goal_pose = getLookAheadPoint(lookahead_distance_, transformed_plan);
+
+  std::vector<float> current_scan;
+  std::vector<float> scan_history;
+  std::vector<float> pedestrian_map;
+  rclcpp::Time scan_received(0, 0, clock_->get_clock_type());
+  rclcpp::Time pedestrians_received(0, 0, clock_->get_clock_type());
+  std::uint64_t scan_generation = 0U;
+  std::uint64_t pedestrian_map_generation = 0U;
+  {
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
+    if (scan_history_.size() != kScanHistoryFrames) {
+      throw nav2_core::PlannerException("DRL-VO scan history is not ready");
     }
-
-    // send lidar scan history data:
-    try {
-      std::string scan_history_yaml = std_msgs::msg::to_yaml(scan_history_msg, true);
-      
-      nav2py_send("scan_history", {scan_history_yaml});
-      RCLCPP_INFO(logger_, "Sent scan history data to Python controller");
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(
-        logger_,
-        "Error sending history scan to Python controller: %s", e.what());
+    current_scan = current_scan_;
+    scan_history.reserve(kScanHistoryFrames * kModelScanSamples);
+    for (const auto & scan : scan_history_) {
+      scan_history.insert(scan_history.end(), scan.begin(), scan.end());
     }
-
-    // Find the first pose which is at a distance greater than the specified lookahed distance
-    // auto goal_pose_it = std::find_if(
-    //   transformed_plan.poses.begin(), transformed_plan.poses.end(), [&](const auto & ps) {
-    //     return hypot(ps.pose.position.x, ps.pose.position.y) >= lookahead_dist_;
-    //   });
-
-    // // If the last pose is still within lookahed distance, take the last pose
-    // if (goal_pose_it == transformed_plan.poses.end()) {
-    //   goal_pose_it = std::prev(transformed_plan.poses.end());
-    // }
-    // auto goal_pose = goal_pose_it;
-
-    auto goal_pose = getLookAheadPoint(lookahead_dist_, transformed_plan, true);
-
-    
-    // Simple implementation that just sends data to Python and waits for response
-    try {
-      sendData(pose, velocity, goal_pose);
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(
-        logger_,
-        "Error sending data: %s", e.what());
-    }
-    
-    geometry_msgs::msg::TwistStamped cmd_vel;
-    cmd_vel.header.frame_id = pose.header.frame_id;
-    cmd_vel.header.stamp = clock_->now();
-    
-    try {
-      RCLCPP_INFO(logger_, "Waiting for velocity command from Python...");
-      cmd_vel.twist = wait_for_cmd_vel();
-      
-      RCLCPP_INFO(
-        logger_, 
-        "Received velocity command: linear_x=%.2f, angular_z=%.2f", 
-        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(
-        logger_,
-        "Error receiving velocity command: %s", e.what());
-      
-      // Default to stop if there's an error
-      cmd_vel.twist.linear.x = 0.0;
-      cmd_vel.twist.angular.z = 0.0;
-    }
-
-    return cmd_vel;
+    pedestrian_map = pedestrian_map_;
+    scan_received = last_scan_received_;
+    pedestrians_received = last_pedestrian_map_received_;
+    scan_generation = scan_generation_;
+    pedestrian_map_generation = pedestrian_map_generation_;
   }
 
-  void DrlVoController::setPlan(const nav_msgs::msg::Path & path)
+  const auto now = clock_->now();
+  if ((now - scan_received).seconds() > scan_timeout_seconds_) {
+    throw nav2_core::PlannerException("DRL-VO scan is stale");
+  }
+  if (require_pedestrian_data_ &&
+    (pedestrians_received.nanoseconds() == 0 ||
+    (now - pedestrians_received).seconds() > pedestrian_timeout_seconds_))
   {
-    global_plan_ = path;
-    global_pub_->publish(path);
+    throw nav2_core::PlannerException("DRL-VO pedestrian data is unavailable or stale");
   }
 
-  void DrlVoController::scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) 
-  {
-    // Store the received scan data
-    scan_msg = *msg;
-    scan_data_ = msg->ranges;
+  const bool scan_changed = scan_generation != sent_scan_generation_;
+  const bool pedestrian_map_changed =
+    pedestrian_map_generation != sent_pedestrian_map_generation_;
+  sendInputs(
+    current_scan, scan_history, pedestrian_map, goal_pose,
+    scan_changed, pedestrian_map_changed);
+  if (scan_changed) {
+    sent_scan_generation_ = scan_generation;
+  }
+  if (pedestrian_map_changed) {
+    sent_pedestrian_map_generation_ = pedestrian_map_generation;
+  }
+  geometry_msgs::msg::Twist command;
+  try {
+    command = wait_for_cmd_vel(
+      std::chrono::milliseconds(
+        static_cast<int64_t>(command_timeout_seconds_ * 1000.0)));
+  } catch (const std::exception & error) {
+    throw nav2_core::PlannerException(
+            std::string("DRL-VO inference process failed: ") + error.what());
+  }
+  if (!std::isfinite(command.linear.x) || !std::isfinite(command.angular.z)) {
+    throw nav2_core::PlannerException("DRL-VO returned a non-finite command");
+  }
+  command.linear.x = std::clamp(command.linear.x, 0.0, active_linear_speed_limit_);
+  command.angular.z = std::clamp(
+    command.angular.z, -max_angular_speed_, max_angular_speed_);
+  if (!commandIsCollisionFree(pose, command)) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000, "DRL-VO command rejected by local costmap collision check");
+    command = geometry_msgs::msg::Twist();
   }
 
-  void DrlVoController::scanHistoryCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) 
-  {
-    // Store the received scan data
-    scan_history_msg = *msg;
+  geometry_msgs::msg::TwistStamped result;
+  result.header.frame_id = pose.header.frame_id;
+  result.header.stamp = now;
+  result.twist = command;
+  return result;
+}
+
+void DrlVoController::sendInputs(
+  const std::vector<float> & current_scan,
+  const std::vector<float> & scan_history,
+  const std::vector<float> & pedestrian_map,
+  const geometry_msgs::msg::PoseStamped & goal_pose,
+  bool scan_changed,
+  bool pedestrian_map_changed)
+{
+  // YAML formatting and parsing dominated the controller budget for these
+  // large fixed-size arrays. Base64 keeps nav2py's delimiter framing intact,
+  // while NumPy decodes the endian-defined float storage without a YAML tree.
+  if (scan_changed) {
+    nav2py_send("scan", {numeric_array_payload(current_scan)});
+    nav2py_send("scan_history", {numeric_array_payload(scan_history)});
+  }
+  if (pedestrian_map_changed) {
+    nav2py_send("pedestrian_map", {numeric_array_payload(pedestrian_map)});
   }
 
-  void DrlVoController::timerCallback()
-  {
-      // Ensure that we have valid data to process
-      if (!scan_data_.empty())
-      {
-          // Stack the scan range data by removing the first and last 20 values
-          std::vector<float> stacked_scan(scan_data_.begin() + 20, scan_data_.end() - 20);
-          scan_history_.push_back(stacked_scan);
+  std::ostringstream goal;
+  goal << "goal_pose:\n  position:\n    x: " << goal_pose.pose.position.x
+       << "\n    y: " << goal_pose.pose.position.y << "\n";
+  nav2py_send("data", {goal.str()});
+}
 
-          ts_cnt++;
-
-          // When we have collected NUM_TP scans, process the data
-          if (ts_cnt == NUM_TP)
-          {   
-              std_msgs::msg::Float32MultiArray msg;
-              // Flatten the 2D vector into a 1D vector (data field)
-              for (const auto& subvector : scan_history_)
-              {
-                  msg.data.insert(msg.data.end(), subvector.begin(), subvector.end());
-              }
-              scan_history_pub_->publish(msg);
-              // scan_history_msg.data = msg.data;
-              // Set the layout dimensions to represent the 2D structure
-              // scan_history_msg.layout.dim.push_back(std_msgs::msg::MultiArrayDimension());
-              // scan_history_msg.layout.dim[0].label = "rows";
-              // scan_history_msg.layout.dim[0].size = scan_history_.size();
-              // scan_history_msg.layout.dim[0].stride = scan_history_.size() * scan_history_[0].size();  // stride = total size of all elements in the 1D array
-              // scan_history_msg.layout.dim.push_back(std_msgs::msg::MultiArrayDimension());
-              // scan_history_msg.layout.dim[1].label = "cols";
-              // scan_history_msg.layout.dim[1].size = scan_history_[0].size();
-              
-              // Reset the data for the next collection cycle
-              ts_cnt = NUM_TP - 1;
-              scan_history_.erase(scan_history_.begin());  // Remove the first (oldest) scan
-              //scan_history_ = std::vector<std::vector<float>>(NUM_TP - 1); // Keep only the last NUM_TP-1 scans
-          }
-      }
-  }
-
-  geometry_msgs::msg::Point 
-  DrlVoController::circleSegmentIntersection(
-  const geometry_msgs::msg::Point & p1,
-  const geometry_msgs::msg::Point & p2,
-  double r)
-  {
-    // Formula for intersection of a line with a circle centered at the origin,
-    // modified to always return the point that is on the segment between the two points.
-    // https://mathworld.wolfram.com/Circle-LineIntersection.html
-    // This works because the poses are transformed into the robot frame.
-    // This can be derived from solving the system of equations of a line and a circle
-    // which results in something that is just a reformulation of the quadratic formula.
-    // Interactive illustration in doc/circle-segment-intersection.ipynb as well as at
-    // https://www.desmos.com/calculator/td5cwbuocd
-    double x1 = p1.x;
-    double x2 = p2.x;
-    double y1 = p1.y;
-    double y2 = p2.y;
-
-    double dx = x2 - x1;
-    double dy = y2 - y1;
-    double dr2 = dx * dx + dy * dy;
-    double D = x1 * y2 - x2 * y1;
-
-    // Augmentation to only return point within segment
-    double d1 = x1 * x1 + y1 * y1;
-    double d2 = x2 * x2 + y2 * y2;
-    double dd = d2 - d1;
-
-    geometry_msgs::msg::Point p;
-    double sqrt_term = std::sqrt(r * r * dr2 - D * D);
-    p.x = (D * dy + std::copysign(1.0, dd) * dx * sqrt_term) / dr2;
-    p.y = (-D * dx + std::copysign(1.0, dd) * dy * sqrt_term) / dr2;
-    return p;
-  }
-
-  geometry_msgs::msg::PoseStamped 
-  DrlVoController::getLookAheadPoint(
-    const double & lookahead_dist,
-    const nav_msgs::msg::Path & transformed_plan,
-    bool interpolate_after_goal)
-  {
-    // Find the first pose which is at a distance greater than the lookahead distance
-    auto goal_pose_it = std::find_if(
-      transformed_plan.poses.begin(), transformed_plan.poses.end(), [&](const auto & ps) {
-        return hypot(ps.pose.position.x, ps.pose.position.y) >= lookahead_dist;
-      });
-
-    // If the no pose is not far enough, take the last pose
-    if (goal_pose_it == transformed_plan.poses.end()) {
-      if (interpolate_after_goal) {
-        auto last_pose_it = std::prev(transformed_plan.poses.end());
-        auto prev_last_pose_it = std::prev(last_pose_it);
-
-        double end_path_orientation = atan2(
-          last_pose_it->pose.position.y - prev_last_pose_it->pose.position.y,
-          last_pose_it->pose.position.x - prev_last_pose_it->pose.position.x);
-
-        // Project the last segment out to guarantee it is beyond the look ahead
-        // distance
-        auto projected_position = last_pose_it->pose.position;
-        projected_position.x += cos(end_path_orientation) * lookahead_dist;
-        projected_position.y += sin(end_path_orientation) * lookahead_dist;
-
-        // Use the circle intersection to find the position at the correct look
-        // ahead distance
-        const auto interpolated_position = circleSegmentIntersection(
-          last_pose_it->pose.position, projected_position, lookahead_dist);
-
-        geometry_msgs::msg::PoseStamped interpolated_pose;
-        interpolated_pose.header = last_pose_it->header;
-        interpolated_pose.pose.position = interpolated_position;
-        return interpolated_pose;
-      } else {
-        goal_pose_it = std::prev(transformed_plan.poses.end());
-      }
-    } else if (goal_pose_it != transformed_plan.poses.begin()) {
-      // Find the point on the line segment between the two poses
-      // that is exactly the lookahead distance away from the robot pose (the origin)
-      // This can be found with a closed form for the intersection of a segment and a circle
-      // Because of the way we did the std::find_if, prev_pose is guaranteed to be inside the circle,
-      // and goal_pose is guaranteed to be outside the circle.
-      auto prev_pose_it = std::prev(goal_pose_it);
-      auto point = circleSegmentIntersection(
-        prev_pose_it->pose.position,
-        goal_pose_it->pose.position, lookahead_dist);
-      geometry_msgs::msg::PoseStamped pose;
-      pose.header.frame_id = prev_pose_it->header.frame_id;
-      pose.header.stamp = goal_pose_it->header.stamp;
-      pose.pose.position = point;
-      return pose;
-    }
-
-    return *goal_pose_it;
-  }
-
-
-  nav_msgs::msg::Path
-  DrlVoController::transformGlobalPlan(
-    const geometry_msgs::msg::PoseStamped & pose)
-  {
-    // Original mplementation taken fron nav2_dwb_controller
-
-    if (global_plan_.poses.empty()) {
-      throw nav2_core::PlannerException("Received plan with zero length");
-    }
-
-    // let's get the pose of the robot in the frame of the plan
-    geometry_msgs::msg::PoseStamped robot_pose;
-    if (!transformPose(
-        tf_, global_plan_.header.frame_id, pose,
-        robot_pose, transform_tolerance_))
-    {
-      throw nav2_core::PlannerException("Unable to transform robot pose into global plan's frame");
-    }
-
-    // We'll discard points on the plan that are outside the local costmap
-    nav2_costmap_2d::Costmap2D * costmap = costmap_ros_->getCostmap();
-    double dist_threshold = std::max(costmap->getSizeInCellsX(), costmap->getSizeInCellsY()) *
-      costmap->getResolution() / 2.0;
-
-    // First find the closest pose on the path to the robot
-    auto transformation_begin =
-      min_by(
-      global_plan_.poses.begin(), global_plan_.poses.end(),
-      [&robot_pose](const geometry_msgs::msg::PoseStamped & ps) {
-        return euclidean_distance(robot_pose, ps);
-      });
-
-    // From the closest point, look for the first point that's further then dist_threshold from the
-    // robot. These points are definitely outside of the costmap so we won't transform them.
-    auto transformation_end = std::find_if(
-      transformation_begin, end(global_plan_.poses),
-      [&](const auto & global_plan_pose) {
-        return euclidean_distance(robot_pose, global_plan_pose) > dist_threshold;
-      });
-
-    // Helper function for the transform below. Transforms a PoseStamped from global frame to local
-    auto transformGlobalPoseToLocal = [&](const auto & global_plan_pose) {
-        // We took a copy of the pose, let's lookup the transform at the current time
-        geometry_msgs::msg::PoseStamped stamped_pose, transformed_pose;
-        stamped_pose.header.frame_id = global_plan_.header.frame_id;
-        stamped_pose.header.stamp = pose.header.stamp;
-        stamped_pose.pose = global_plan_pose.pose;
-        transformPose(
-          tf_, costmap_ros_->getBaseFrameID(),
-          stamped_pose, transformed_pose, transform_tolerance_);
-        return transformed_pose;
-      };
-
-    // Transform the near part of the global plan into the robot's frame of reference.
-    nav_msgs::msg::Path transformed_plan;
-    std::transform(
-      transformation_begin, transformation_end,
-      std::back_inserter(transformed_plan.poses),
-      transformGlobalPoseToLocal);
-    transformed_plan.header.frame_id = costmap_ros_->getBaseFrameID();
-    transformed_plan.header.stamp = pose.header.stamp;
-
-    // Remove the portion of the global plan that we've already passed so we don't
-    // process it on the next iteration (this is called path pruning)
-    global_plan_.poses.erase(begin(global_plan_.poses), transformation_begin);
-    global_pub_->publish(transformed_plan);
-
-    if (transformed_plan.poses.empty()) {
-      throw nav2_core::PlannerException("Resulting plan has 0 poses in it.");
-    }
-
-    return transformed_plan;
-  }
-
-  bool DrlVoController::transformPose(
-    const std::shared_ptr<tf2_ros::Buffer> tf,
-    const std::string frame,
-    const geometry_msgs::msg::PoseStamped & in_pose,
-    geometry_msgs::msg::PoseStamped & out_pose,
-    const rclcpp::Duration & transform_tolerance
-  ) const
-  {
-    // Implementation taken as is fron nav_2d_utils in nav2_dwb_controller
-
-    if (in_pose.header.frame_id == frame) {
-      out_pose = in_pose;
-      return true;
-    }
-
-    try {
-      tf->transform(in_pose, out_pose, frame);
-      return true;
-    } catch (tf2::ExtrapolationException & ex) {
-      auto transform = tf->lookupTransform(
-        frame,
-        in_pose.header.frame_id,
-        tf2::TimePointZero
-      );
-      if (
-        (rclcpp::Time(in_pose.header.stamp) - rclcpp::Time(transform.header.stamp)) >
-        transform_tolerance)
-      {
-        RCLCPP_ERROR(
-          rclcpp::get_logger("tf_help"),
-          "Transform data too old when converting from %s to %s",
-          in_pose.header.frame_id.c_str(),
-          frame.c_str()
-        );
-        RCLCPP_ERROR(
-          rclcpp::get_logger("tf_help"),
-          "Data time: %ds %uns, Transform time: %ds %uns",
-          in_pose.header.stamp.sec,
-          in_pose.header.stamp.nanosec,
-          transform.header.stamp.sec,
-          transform.header.stamp.nanosec
-        );
-        return false;
-      } else {
-        tf2::doTransform(in_pose, out_pose, transform);
-        return true;
-      }
-    } catch (tf2::TransformException & ex) {
-      RCLCPP_ERROR(
-        rclcpp::get_logger("tf_help"),
-        "Exception in transformPose: %s",
-        ex.what()
-      );
+bool DrlVoController::commandIsCollisionFree(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & command) const
+{
+  auto * costmap = costmap_ros_->getCostmap();
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*costmap->getMutex());
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *>
+  checker(costmap);
+  const auto footprint = costmap_ros_->getRobotFootprint();
+  double x = pose.pose.position.x;
+  double y = pose.pose.position.y;
+  double yaw = tf2::getYaw(pose.pose.orientation);
+  const int steps = static_cast<int>(std::ceil(
+      collision_check_horizon_ / collision_check_step_));
+  for (int step = 0; step <= steps; ++step) {
+    const double cost = checker.footprintCostAtPose(x, y, yaw, footprint);
+    if (cost < 0.0 || cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
       return false;
     }
+    x += command.linear.x * std::cos(yaw) * collision_check_step_;
+    y += command.linear.x * std::sin(yaw) * collision_check_step_;
+    yaw += command.angular.z * collision_check_step_;
+  }
+  return true;
+}
+
+void DrlVoController::setPlan(const nav_msgs::msg::Path & path)
+{
+  std::lock_guard<std::mutex> lock(plan_mutex_);
+  global_plan_ = path;
+  global_plan_publisher_->publish(path);
+}
+
+geometry_msgs::msg::Point DrlVoController::circleSegmentIntersection(
+  const geometry_msgs::msg::Point & first,
+  const geometry_msgs::msg::Point & second,
+  double radius) const
+{
+  const double delta_x = second.x - first.x;
+  const double delta_y = second.y - first.y;
+  const double squared_length = delta_x * delta_x + delta_y * delta_y;
+  if (squared_length <= std::numeric_limits<double>::epsilon()) {
+    return second;
+  }
+  const double determinant = first.x * second.y - second.x * first.y;
+  const double first_distance = first.x * first.x + first.y * first.y;
+  const double second_distance = second.x * second.x + second.y * second.y;
+  const double discriminant = std::max(
+    0.0, radius * radius * squared_length - determinant * determinant);
+  const double root = std::sqrt(discriminant);
+  const double direction = std::copysign(1.0, second_distance - first_distance);
+  geometry_msgs::msg::Point result;
+  result.x = (determinant * delta_y + direction * delta_x * root) / squared_length;
+  result.y = (-determinant * delta_x + direction * delta_y * root) / squared_length;
+  return result;
+}
+
+geometry_msgs::msg::PoseStamped DrlVoController::getLookAheadPoint(
+  double lookahead_distance,
+  const nav_msgs::msg::Path & transformed_plan) const
+{
+  if (transformed_plan.poses.empty()) {
+    throw nav2_core::PlannerException("DRL-VO transformed plan is empty");
+  }
+  if (transformed_plan.poses.size() == 1U) {
+    return transformed_plan.poses.front();
+  }
+
+  auto goal = std::find_if(
+    transformed_plan.poses.begin(), transformed_plan.poses.end(),
+    [lookahead_distance](const auto & pose) {
+      return std::hypot(pose.pose.position.x, pose.pose.position.y) >=
+      lookahead_distance;
+    });
+  if (goal == transformed_plan.poses.end()) {
+    goal = std::prev(transformed_plan.poses.end());
+    const auto previous = std::prev(goal);
+    const double heading = std::atan2(
+      goal->pose.position.y - previous->pose.position.y,
+      goal->pose.position.x - previous->pose.position.x);
+    auto projected = goal->pose.position;
+    projected.x += std::cos(heading) * lookahead_distance;
+    projected.y += std::sin(heading) * lookahead_distance;
+    auto output = *goal;
+    output.pose.position = circleSegmentIntersection(
+      goal->pose.position, projected, lookahead_distance);
+    return output;
+  }
+  if (goal != transformed_plan.poses.begin()) {
+    auto output = *goal;
+    output.pose.position = circleSegmentIntersection(
+      std::prev(goal)->pose.position, goal->pose.position, lookahead_distance);
+    return output;
+  }
+  return *goal;
+}
+
+nav_msgs::msg::Path DrlVoController::transformGlobalPlan(
+  const geometry_msgs::msg::PoseStamped & pose)
+{
+  std::lock_guard<std::mutex> lock(plan_mutex_);
+  if (global_plan_.poses.empty()) {
+    throw nav2_core::PlannerException("DRL-VO received a zero-length plan");
+  }
+
+  geometry_msgs::msg::PoseStamped robot_pose;
+  if (!transformPose(global_plan_.header.frame_id, pose, robot_pose)) {
+    throw nav2_core::PlannerException("Unable to transform robot pose into plan frame");
+  }
+  auto * costmap = costmap_ros_->getCostmap();
+  const double distance_threshold = std::max(
+    costmap->getSizeInCellsX(), costmap->getSizeInCellsY()) *
+    costmap->getResolution() / 2.0;
+  const auto begin = min_by(
+    global_plan_.poses.begin(), global_plan_.poses.end(),
+    [&robot_pose](const auto & plan_pose) {
+      return nav2_util::geometry_utils::euclidean_distance(robot_pose, plan_pose);
+    });
+  const auto end = std::find_if(
+    begin, global_plan_.poses.end(),
+    [&robot_pose, distance_threshold](const auto & plan_pose) {
+      return nav2_util::geometry_utils::euclidean_distance(robot_pose, plan_pose) >
+      distance_threshold;
+    });
+
+  nav_msgs::msg::Path transformed;
+  transformed.header.frame_id = costmap_ros_->getBaseFrameID();
+  transformed.header.stamp = pose.header.stamp;
+  for (auto current = begin; current != end; ++current) {
+    geometry_msgs::msg::PoseStamped stamped = *current;
+    stamped.header.frame_id = global_plan_.header.frame_id;
+    stamped.header.stamp = pose.header.stamp;
+    geometry_msgs::msg::PoseStamped local;
+    if (!transformPose(costmap_ros_->getBaseFrameID(), stamped, local)) {
+      throw nav2_core::PlannerException("Unable to transform global plan pose");
+    }
+    transformed.poses.push_back(local);
+  }
+  global_plan_.poses.erase(global_plan_.poses.begin(), begin);
+  global_plan_publisher_->publish(transformed);
+  if (transformed.poses.empty()) {
+    throw nav2_core::PlannerException("DRL-VO transformed plan has no poses");
+  }
+  return transformed;
+}
+
+bool DrlVoController::transformPose(
+  const std::string & frame,
+  const geometry_msgs::msg::PoseStamped & input,
+  geometry_msgs::msg::PoseStamped & output) const
+{
+  if (input.header.frame_id == frame) {
+    output = input;
+    return true;
+  }
+  try {
+    output = tf_->transform(
+      input, frame, tf2::durationFromSec(transform_tolerance_seconds_));
+    return true;
+  } catch (const tf2::TransformException & error) {
+    RCLCPP_ERROR_THROTTLE(
+      logger_, *clock_, 1000, "DRL-VO transform failed: %s", error.what());
     return false;
   }
+}
 
 }  // namespace nav2py_drl_vo_controller
 
-// Register this controller as a nav2_core plugin
-PLUGINLIB_EXPORT_CLASS(nav2py_drl_vo_controller::DrlVoController, nav2_core::Controller)
+PLUGINLIB_EXPORT_CLASS(
+  nav2py_drl_vo_controller::DrlVoController, nav2_core::Controller)

@@ -10,7 +10,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   
   <depend>nav2py</depend>
-  <depend>ament_cmake_venv_uv</depend>
+  <depend>ament_cmake_venv</depend>
 
   <depend>nav2_common</depend>
   <depend>nav2_core</depend>
@@ -21,13 +21,15 @@
   <depend>nav2_msgs</depend>
   <depend>pluginlib</depend>
   <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
   <depend>ament_index_cpp</depend>
-  <!-- Scan -->
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
 
   <exec_depend>nav2_bringup</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

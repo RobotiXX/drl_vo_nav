@@ -212,6 +212,13 @@ Finally, you can use roslaunch drl_vo to navigate:
 roslaunch drl_vo_nav drl_vo_nav.launch
 ```
 
+## ROS 2 and RWD adapter
+
+The hardened ROS 2/Nav2 adapter and RWD integration are documented in
+[`nav2py_drl_vo/README.md`](nav2py_drl_vo/README.md). In particular, that guide
+distinguishes the complete social policy from the upstream adapter's zeroed
+pedestrian-input ablation.
+
 ## Citation
 ```
 @article{xie2023drl,

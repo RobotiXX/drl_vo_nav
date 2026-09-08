@@ -1,151 +1,186 @@
+"""Training-compatible DRL-VO observation preprocessing and inference."""
+
+import base64
+import binascii
+from pathlib import Path
 import sys
-import os
+import time
+
 import numpy as np
-import numpy.matlib
-from stable_baselines3 import PPO
-
-from geometry_msgs.msg import Twist
-
-# Add the current directory to sys.path
-sys.path.append(os.path.dirname(os.path.realpath(__file__)))
-
-from custom_cnn_full import CustomCNN
-
-# from nav2py.interfaces import Controller
-
-#-----------------------------------------------------------------------------
-#
-# global variables are listed here
-#
-#-----------------------------------------------------------------------------
-
-# for reproducibility, we seed the rng
-#       
-policy_kwargs = dict(
-    features_extractor_class=CustomCNN,
-    features_extractor_kwargs=dict(features_dim=256),
-)
 
 
-class DrlVoPlanner():
-    def __init__(self):
-        # super().__init__()
-        # Initialize your planner's parameters
-        self.vx_limit = None
-        self.wz_limit = None
-        self.range_limit = None
+PEDESTRIAN_MAP_SIZE = 2 * 80 * 80
+SCAN_HISTORY_FRAMES = 10
+SCAN_SAMPLES = 720
+SCAN_FEATURE_SIZE = 20 * 80 * 4
+OBSERVATION_SIZE = PEDESTRIAN_MAP_SIZE + SCAN_FEATURE_SIZE + 2
 
-        self.vx = 0.
-        self.wz = 0.
-        self.model = None
 
-        # load model:
-        if(self.model == None):
-            package_share_dir = os.path.dirname(__file__)
-            model_path = os.path.join(package_share_dir, '../../../..', 'share', 'model')
-            model_file = os.path.join(model_path, 'drl_vo.zip')
-            self.model = PPO.load(model_file, device='cpu')
+class DrlVoInputError(ValueError):
+    """Raised when runtime sensor data does not match the trained policy."""
 
-        print("Finish loading model.")
-        
-    def configure(self, range_limit=30., vx_limit=0.5, wz_limit=0.7):
-        """Configure your planner with parameters"""
-        self.range_limit = range_limit
-        self.vx_limit = vx_limit
-        self.wz_limit = wz_limit
-        
-    def compute_velocity_commands(self, scan_history, current_scan, sub_goal):
-        """
-        Implement your navigation algorithm here
-        
-        Args:
-            current_pose: Current robot pose (geometry_msgs/Pose)
-            current_velocity: Current robot velocity (geometry_msgs/Twist)
-            goal_pose: Goal pose (geometry_msgs/Pose)
-            
-        Returns:
-            velocity_command: Desired velocity command (geometry_msgs/Twist)
-        """
-        # Your navigation logic here
-        # minimum distance:
-        len_scan = len(current_scan)
-        scan = np.array(current_scan[int(len_scan/2-len_scan/9):int(len_scan/2+len_scan/9)])# [360-40:-360+40])
-        scan = scan[scan!=0]
-        if(scan.size != 0):
-            min_scan_dist = np.amin(scan)
+
+def decode_numeric_array(messages, expected_size, name):
+    """Decode one base64, big-endian float32 nav2py array payload."""
+    if not isinstance(messages, list) or len(messages) != 1:
+        raise DrlVoInputError(f'{name} expected exactly one nav2py payload')
+    payload = messages[0]
+    prefix = b'b64f32be:'
+    if isinstance(payload, str):
+        payload = payload.encode('ascii')
+    if not isinstance(payload, bytes) or not payload.startswith(prefix):
+        raise DrlVoInputError(f'{name} has an unsupported encoding')
+    try:
+        decoded = base64.b64decode(payload[len(prefix):], validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise DrlVoInputError(f'{name} has invalid base64 data') from error
+    expected_bytes = expected_size * np.dtype(np.float32).itemsize
+    if len(decoded) != expected_bytes:
+        raise DrlVoInputError(
+            f'{name} has {len(decoded)} bytes; expected {expected_bytes}'
+        )
+    values = np.frombuffer(decoded, dtype='>f4').astype(np.float32)
+    if not np.all(np.isfinite(values)):
+        raise DrlVoInputError(f'{name} contains a non-finite value')
+    return values
+
+
+class DrlVoPlanner:
+    """Load the DRL-VO policy and convert ROS-facing arrays into observations."""
+
+    def __init__(self, model_file=None, model=None):
+        if model is not None:
+            self.model = model
         else:
-            min_scan_dist = 30.
+            if not model_file:
+                raise DrlVoInputError('model_file is required')
+            self.model = self._load_model(Path(model_file))
+        self.range_limit = 30.0
+        self.vx_limit = 0.5
+        self.wz_limit = 0.7
+        self.min_obstacle_distance = 0.45
 
-        cmd_vel = Twist()
-        # if the goal is close to the robot:
-        # if np.linalg.norm(sub_goal) <= 0.9: 
-        #     cmd_vel.linear.x = 0.
-        #     cmd_vel.angular.z = 0.
-        if min_scan_dist <= 0.45: 
-            cmd_vel.linear.x = 0.
-            cmd_vel.angular.z = self.wz_limit 
-        else:
-            # MaxAbsScaler:
-            # v_min = -2 
-            # v_max = 2 
-            # ped_map = np.array(ped_map, dtype=np.float32)
-            # ped_map = 2 * (ped_map - v_min) / (v_max - v_min) + (-1)
-            ped_map = np.zeros(12800)
+    @staticmethod
+    def _load_model(model_file):
+        if not model_file.is_file():
+            raise DrlVoInputError(f'DRL-VO checkpoint does not exist: {model_file}')
 
-            # MaxAbsScaler:
-            temp = np.array(scan_history, dtype=np.float32)
-            scan_avg = np.zeros((20,80))
-            for n in range(10):
-                scan_tmp = temp[n*len_scan:(n+1)*len_scan] #temp[n*720:(n+1)*720]
-                # scan_tmp = scan_tmp[int(len_scan/2 - len_scan/4):int(len_scan/2 + len_scan/4)]
-                if(len(scan_tmp) > 0):
-                    for i in range(80):
-                        step = int(len_scan / 80)
-                        scan_avg[2*n, i] = np.min(scan_tmp[i*step:(i+1)*step]) #np.min(scan_tmp[i*9:(i+1)*9])
-                        scan_avg[2*n+1, i] = np.mean(scan_tmp[i*step:(i+1)*step]) #np.mean(scan_tmp[i*9:(i+1)*9])
-            
-            scan_avg = scan_avg.reshape(1600)
-            scan_avg_map = np.matlib.repmat(scan_avg,1,4)
-            scan_map = scan_avg_map.reshape(6400)
-            s_min = 0.
-            s_max = self.range_limit #30.
-            scan_map = 2 * (scan_map - s_min) / (s_max - s_min) + (-1)
-            
-            # goal:
-            # MaxAbsScaler:
-            g_min = -1.
-            g_max = 1.
-            goal_orignal = np.array(sub_goal, dtype=np.float32)
-            sub_goal = 2 * (goal_orignal - g_min) / (g_max - g_min) + (-1)
-            #sub_goal = sub_goal.tolist()
+        # The Stable-Baselines3 archive stores this historical top-level module
+        # name. Register the packaged module before unpickling the trusted model.
+        from . import custom_cnn_full
+        sys.modules.setdefault('custom_cnn_full', custom_cnn_full)
+        from stable_baselines3 import PPO
 
-            # observation:
-            observation = np.concatenate((ped_map, scan_map, sub_goal), axis=None) 
+        return PPO.load(str(model_file), device='cpu')
 
-            #self.inference()
-            action, _states = self.model.predict(observation, deterministic=True)
+    def configure(
+        self,
+        range_limit=30.0,
+        vx_limit=0.5,
+        wz_limit=0.7,
+        min_obstacle_distance=0.45,
+    ):
+        """Configure physical scaling applied around the fixed policy."""
+        if range_limit <= 0.0:
+            raise DrlVoInputError('range_limit must be positive')
+        if vx_limit <= 0.0 or wz_limit <= 0.0:
+            raise DrlVoInputError('velocity limits must be positive')
+        if min_obstacle_distance < 0.0:
+            raise DrlVoInputError('min_obstacle_distance cannot be negative')
+        self.range_limit = float(range_limit)
+        self.vx_limit = float(vx_limit)
+        self.wz_limit = float(wz_limit)
+        self.min_obstacle_distance = float(min_obstacle_distance)
 
-            # calculate the goal velocity of the robot and send the command
-            # velocities:
-            vx_min = 0
-            if(self.vx_limit >= 0.75):
-                if(min_scan_dist >= 2.5):  # free space margin
-                    vx_max = self.vx_limit #0.75
-                else:
-                    vx_max = self.vx_limit / 1.5 #0.5 
-            else:
-                vx_max = self.vx_limit
-            
-            if(self.wz_limit >= 1):
-                vz_min = -self.wz_limit / 1.5 
-                vz_max = self.wz_limit  / 1.5 
-            else:
-                vz_min = -self.wz_limit #-0.7 
-                vz_max = self.wz_limit #0.7
+    def warm_up(self):
+        """Run one discarded inference before the real-time control loop."""
+        start = time.perf_counter()
+        self.compute_velocity_commands(
+            pedestrian_map=np.zeros(PEDESTRIAN_MAP_SIZE, dtype=np.float32),
+            scan_history=np.full(
+                SCAN_HISTORY_FRAMES * SCAN_SAMPLES,
+                self.range_limit,
+                dtype=np.float32,
+            ),
+            current_scan=np.full(
+                SCAN_SAMPLES, self.range_limit, dtype=np.float32
+            ),
+            sub_goal=np.asarray([2.0, 0.0], dtype=np.float32),
+        )
+        return time.perf_counter() - start
 
-            # MaxAbsScaler inverse:
-            cmd_vel.linear.x = (action[0] + 1) * (vx_max - vx_min) / 2. + vx_min
-            cmd_vel.angular.z = (action[1] + 1) * (vz_max - vz_min) / 2. + vz_min
+    @staticmethod
+    def _finite_array(values, expected_size, name):
+        result = np.asarray(values, dtype=np.float32).reshape(-1)
+        if result.size != expected_size:
+            raise DrlVoInputError(
+                f'{name} has {result.size} values; expected {expected_size}'
+            )
+        if not np.all(np.isfinite(result)):
+            raise DrlVoInputError(f'{name} contains a non-finite value')
+        return result
 
-        velocity_command = cmd_vel
-        return velocity_command
+    def build_observation(self, pedestrian_map, scan_history, sub_goal):
+        """Build the 19,202-value observation used by the released model."""
+        pedestrians = self._finite_array(
+            pedestrian_map, PEDESTRIAN_MAP_SIZE, 'pedestrian_map'
+        )
+        scans = self._finite_array(
+            scan_history,
+            SCAN_HISTORY_FRAMES * SCAN_SAMPLES,
+            'scan_history',
+        ).reshape(SCAN_HISTORY_FRAMES, 80, 9)
+        goal = self._finite_array(sub_goal, 2, 'sub_goal')
+
+        # These transformations match the ROS 1 inference implementation used
+        # to train the released archive: velocities and the 2 m subgoal are
+        # scaled from [-2, 2] to [-1, 1].
+        pedestrian_features = np.clip(pedestrians, -2.0, 2.0) / 2.0
+        goal_features = np.clip(goal, -2.0, 2.0) / 2.0
+
+        scan_min = np.min(scans, axis=2)
+        scan_mean = np.mean(scans, axis=2)
+        scan_features = np.empty((SCAN_HISTORY_FRAMES, 2, 80), dtype=np.float32)
+        scan_features[:, 0, :] = scan_min
+        scan_features[:, 1, :] = scan_mean
+        scan_features = np.tile(scan_features.reshape(-1), 4)
+        scan_features = np.clip(scan_features, 0.0, self.range_limit)
+        scan_features = 2.0 * scan_features / self.range_limit - 1.0
+
+        observation = np.concatenate(
+            (pedestrian_features, scan_features, goal_features)
+        ).astype(np.float32, copy=False)
+        if observation.size != OBSERVATION_SIZE:
+            raise AssertionError('internal DRL-VO observation shape mismatch')
+        return observation
+
+    def compute_velocity_commands(
+        self,
+        pedestrian_map,
+        scan_history,
+        current_scan,
+        sub_goal,
+    ):
+        """Return forward and angular velocity for one synchronized sample."""
+        scan = self._finite_array(current_scan, SCAN_SAMPLES, 'current_scan')
+
+        # The original 1080-ray lidar was cropped to a 240-degree, 720-value
+        # model scan. Indices 180:540 are therefore the forward +/-60 degrees.
+        forward_scan = scan[180:540]
+        valid_forward_scan = forward_scan[forward_scan > 0.0]
+        if (
+            valid_forward_scan.size
+            and np.min(valid_forward_scan) <= self.min_obstacle_distance
+        ):
+            return 0.0, 0.0
+
+        observation = self.build_observation(
+            pedestrian_map, scan_history, sub_goal
+        )
+        action, _state = self.model.predict(observation, deterministic=True)
+        action = self._finite_array(action, 2, 'policy_action')
+        action = np.clip(action, -1.0, 1.0)
+
+        linear_x = (float(action[0]) + 1.0) * self.vx_limit / 2.0
+        angular_z = float(action[1]) * self.wz_limit
+        return linear_x, angular_z

@@ -38,6 +38,12 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_message_reader test/test_message_reader.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/nav2py)
+endif()
+
 ament_package(
   CONFIG_EXTRAS "nav2py-extras.cmake"
 )

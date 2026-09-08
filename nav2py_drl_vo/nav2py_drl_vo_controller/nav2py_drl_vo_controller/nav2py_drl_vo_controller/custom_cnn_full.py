@@ -1,3 +1,6 @@
+"""Checkpoint-coupled feature extractor from the released DRL-VO model."""
+# flake8: noqa
+
 # import pytorch modules:
 #
 import torch
@@ -48,12 +51,12 @@ def set_seed(seed):
 #
 #------------------------------------------------------------------------------
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    """3x3 convolution with padding"""
+    """Create a 3x3 convolution with padding."""
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
+    """Create a 1x1 convolution."""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 class Bottleneck(nn.Module):

@@ -9,6 +9,31 @@ import sys
 import typing
 
 
+class _DelimitedMessageReader:
+    """Read nav2py messages without one system call and copy per byte."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def receive(
+        self, conn: socket.socket
+    ) -> typing.Tuple[str, typing.List[bytes]]:
+        """Return one delimiter-framed message and retain following bytes."""
+        separator = bytes((1,))
+        while True:
+            end_index = self._buffer.find(3)
+            if end_index >= 0:
+                payload = bytes(self._buffer[:end_index])
+                del self._buffer[:end_index + 1]
+                name, *content = payload.split(separator)
+                return name.decode(), content
+
+            chunk = conn.recv(65536)
+            if not chunk:
+                raise ConnectionError('nav2py controller socket closed')
+            self._buffer.extend(chunk)
+
+
 class nav2py_costmap_controller(abc.ABC):
     """
     nav2py costmap controller base
@@ -43,30 +68,16 @@ class nav2py_costmap_controller(abc.ABC):
     def serve(self):
         conn, addr = self._socket.accept()
         self._conn = conn
-
-        SEP_BYTE = int.to_bytes(1, 1, 'big')
-        END_BYTE = int.to_bytes(3, 1, 'big')
-
-        def receive_msg() -> typing.Tuple[str, typing.List[bytes]]:
-            buffer: bytes = bytes()
-            while True:
-                byte = conn.recv(1)
-                if byte == END_BYTE:
-                    break
-                buffer += byte
-
-            name, *content = buffer.split(SEP_BYTE)
-            return name.decode(), content
+        reader = _DelimitedMessageReader()
 
         with conn:
             while True:
-                name, content = receive_msg()
+                name, content = reader.receive(conn)
                 if name in self.__callbacks:
                     self.__callbacks[name](content)
 
     def _send_cmd_vel(self, linear_x: float, angular_z: float):
-        self._conn.send(struct.pack('!d', linear_x))
-        self._conn.send(struct.pack('!d', angular_z))
+        self._conn.sendall(struct.pack('!dd', linear_x, angular_z))
 
     def cleanup(self):
         self._socket.close()

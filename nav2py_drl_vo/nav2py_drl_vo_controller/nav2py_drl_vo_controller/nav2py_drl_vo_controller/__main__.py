@@ -1,201 +1,139 @@
-import yaml
+"""Socket process used by the DRL-VO Nav2 controller plugin."""
+
+import argparse
+import logging
+
 import numpy as np
-import nav2py
+import yaml
+
 import nav2py.interfaces
-import rclpy
-from rclpy.node import Node
-from rclpy.logging import get_logger
 
 from .planner import DrlVoPlanner
+from .planner import decode_numeric_array
+from .planner import PEDESTRIAN_MAP_SIZE
+from .planner import SCAN_HISTORY_FRAMES
+from .planner import SCAN_SAMPLES
 
-NUM_TP = 10
 
-class nav2py_drl_vo_controller(nav2py.interfaces.nav2py_costmap_controller):
+class DrlVoControllerProcess(nav2py.interfaces.nav2py_costmap_controller):
+    """Run DRL-VO inference behind nav2py's loopback socket protocol."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        model_file,
+        range_limit,
+        vx_limit,
+        wz_limit,
+        min_obstacle_distance,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self.logger = logging.getLogger('nav2py_drl_vo_controller')
+        self.planner = DrlVoPlanner(model_file=model_file)
+        self.planner.configure(
+            range_limit=range_limit,
+            vx_limit=vx_limit,
+            wz_limit=wz_limit,
+            min_obstacle_distance=min_obstacle_distance,
+        )
+        warmup_seconds = self.planner.warm_up()
+        self.current_scan = None
+        self.scan_history = None
+        self.pedestrian_map = np.zeros(PEDESTRIAN_MAP_SIZE, dtype=np.float32)
+        self.sub_goal = None
 
-         # Create and configure your planner
-        print("Load DRLVO")
-        self.planner = DrlVoPlanner()
-        self.rang_limit = 30.
-        self.planner.configure(range_limit=self.rang_limit, vx_limit=0.26)
-
-        # Register callbacks
-        self._register_callback('data', self._data_callback)
-        self._register_callback('path', self._path_callback)
         self._register_callback('scan', self._scan_callback)
         self._register_callback('scan_history', self._scan_history_callback)
-        
-        self.logger = get_logger('nav2py_drl_vo_controller')
-        self.frame_count = 0
-        self.path = None
-        self.scan_history = np.zeros(3200)
-        self.scan_tmp = np.zeros(360)
-        self.sub_goal = np.zeros(2)
+        self._register_callback('pedestrian_map', self._pedestrian_map_callback)
+        self._register_callback('data', self._data_callback)
+        self.logger.info(
+            'DRL-VO checkpoint loaded and warmed in %.3f s', warmup_seconds
+        )
 
-        # DRL-VO input:
-        # self.scan_input = None
-        # self.goal_input = None
+    @staticmethod
+    def _decode_yaml(messages):
+        if not isinstance(messages, list) or len(messages) != 1:
+            raise ValueError('expected exactly one nav2py payload')
+        payload = messages[0]
+        if isinstance(payload, bytes):
+            payload = payload.decode('utf-8')
+        return yaml.safe_load(payload)
 
-        self.logger.info("nav2py_drl_vo_controller initialized")
+    def _scan_callback(self, messages):
+        self.current_scan = decode_numeric_array(
+            messages, SCAN_SAMPLES, 'current_scan'
+        )
 
-    def _path_callback(self, path_):
-        """
-        Process path data from C++ controller
-        """
+    def _scan_history_callback(self, messages):
+        self.scan_history = decode_numeric_array(
+            messages,
+            SCAN_HISTORY_FRAMES * SCAN_SAMPLES,
+            'scan_history',
+        )
+
+    def _pedestrian_map_callback(self, messages):
+        self.pedestrian_map = decode_numeric_array(
+            messages, PEDESTRIAN_MAP_SIZE, 'pedestrian_map'
+        )
+
+    def _data_callback(self, messages):
+        """Update the subgoal, infer once, and answer the waiting Nav2 tick."""
         try:
-            if isinstance(path_, list) and len(path_) > 0:
-                data_str = path_[0]
-                if isinstance(data_str, bytes):
-                    data_str = data_str.decode()
-                
-                self.path = yaml.safe_load(data_str)
-                self.logger.info("Received path data")
-                
-                # You could extract the goal position from the path if needed
-                if self.path and 'poses' in self.path and len(self.path['poses']) > 0:
-                    last_pose = self.path['poses'][-1]['pose']
-                    goal_x = last_pose['position']['x']
-                    goal_y = last_pose['position']['y']
-                    self.logger.info(f"Goal position: x={goal_x:.2f}, y={goal_y:.2f}")
-
-        except Exception as e:
-            import traceback
-            self.logger.error(f"Error processing path data: {e}")
-            self.logger.error(traceback.format_exc())
-    
-    def _scan_callback(self, scan_):
-        """
-        Process path data from C++ controller
-        """
-        try:
-            if isinstance(scan_, list) and len(scan_) > 0:
-                data_str = scan_[0]
-                if isinstance(data_str, bytes):
-                    data_str = data_str.decode()
-                
-                scan = yaml.safe_load(data_str)
-                scan_data = np.array(scan['ranges'], dtype=np.float32)
-                scan_data[np.isnan(scan_data)] = self.rang_limit 
-                scan_data[np.isinf(scan_data)] = self.rang_limit 
-                self.scan_tmp = scan_data
-                self.logger.info("Received scan data")
-        
-        except Exception as e:
-            import traceback
-            self.logger.error(f"Error processing scan data: {e}")
-            self.logger.error(traceback.format_exc())
-
-    def _scan_history_callback(self, scan_history_):
-        """
-        Process path data from C++ controller
-        """
-        try:
-            if isinstance(scan_history_, list) and len(scan_history_) > 0:
-                data_str = scan_history_[0]
-                if isinstance(data_str, bytes):
-                    data_str = data_str.decode()
-                
-                scan_history = yaml.safe_load(data_str)
-                scan_data = np.array(scan_history['data'], dtype=np.float32)
-                scan_data[np.isnan(scan_data)] = self.rang_limit 
-                scan_data[np.isinf(scan_data)] = self.rang_limit 
-                self.scan_history = scan_data #.tolist()
-                self.logger.info("Received scan history data")
-                # self.logger.info(f"Scan data size: {scan_data.size}")
-                # self.logger.info(f"First 20 elements of scan data: {scan_data[:min(20, scan_data.size)]}")
-
-                # Use your planner to compute velocity commands
-                velocity_command = self.planner.compute_velocity_commands(
-                    scan_history = self.scan_history,
-                    current_scan = self.scan_tmp,
-                    sub_goal = self.sub_goal
-                )
-                
-                # Send velocity commands
-                self._send_cmd_vel(
-                    velocity_command.linear.x,
-                    velocity_command.angular.z
-                )
-            
-        except Exception as e:
-            import traceback
-            self.logger.error(f"Error processing scan history data: {e}")
-            self.logger.error(traceback.format_exc())
-
-            # Send a safe stop command in case of error
+            data = self._decode_yaml(messages)
+            goal = data['goal_pose']['position']
+            self.sub_goal = np.asarray([goal['x'], goal['y']], dtype=np.float32)
+            if self.current_scan is None:
+                raise ValueError('current scan is unavailable')
+            if self.scan_history is None:
+                raise ValueError('scan history is unavailable')
+            if self.scan_history.size != SCAN_HISTORY_FRAMES * SCAN_SAMPLES:
+                raise ValueError('scan history is not ready')
+            linear_x, angular_z = self.planner.compute_velocity_commands(
+                pedestrian_map=self.pedestrian_map,
+                scan_history=self.scan_history,
+                current_scan=self.current_scan,
+                sub_goal=self.sub_goal,
+            )
+            self._send_cmd_vel(linear_x, angular_z)
+        except Exception:
+            self.logger.exception('DRL-VO inference failed; commanding stop')
             self._send_cmd_vel(0.0, 0.0)
 
-    def _data_callback(self, data):
-        """
-        Process data from C++ controller
-        """
-        try:
-            self.frame_count += 1
-            
-            # Simple frame delimiter for logging
-            frame_delimiter = "=" * 50
-            self.logger.info(f"\n{frame_delimiter}")
-            self.logger.info(f"PROCESSING FRAME {self.frame_count}")
-            
-            # Parse the incoming data
-            if isinstance(data, list) and len(data) > 0:
-                data_str = data[0]
-                if isinstance(data_str, bytes):
-                    data_str = data_str.decode()
-                
-                parsed_data = yaml.safe_load(data_str)
-                self.logger.info("Data decoded successfully")
-            else:
-                if isinstance(data, bytes):
-                    parsed_data = yaml.safe_load(data.decode())
-                    self.logger.info("Data decoded from bytes")
-                else:
-                    self.logger.error(f"Unexpected data type: {type(data)}")
-                    # Send a stop command if we can't parse the data
-                    self._send_cmd_vel(0.0, 0.0)
-                    return
-            
-            # Extract frame info
-            frame_info = parsed_data.get('frame_info', {})
-            frame_id = frame_info.get('id', 0)
-            timestamp = frame_info.get('timestamp', 0)
-            self.logger.info(f"Frame ID: {frame_id}, Timestamp: {timestamp}")
-            
-            # Extract robot pose
-            robot_pose = parsed_data.get('robot_pose', {})
-            position = robot_pose.get('position', {})
-            x = position.get('x', 0.0)
-            y = position.get('y', 0.0)
-            self.logger.info(f"Robot position: x={x:.2f}, y={y:.2f}")
-            
-            # Extract velocity if available
-            velocity = parsed_data.get('robot_velocity', {})
-            linear_x = velocity.get('linear', {}).get('x', 0.0)
-            angular_z = velocity.get('angular', {}).get('z', 0.0)
-            self.logger.info(f"Current velocity: linear_x={linear_x:.2f}, angular_z={angular_z:.2f}")
-            
-            # Extract goal pose
-            goal_pose = parsed_data.get('goal_pose', {})
-            goal_position = goal_pose.get('position', {})
-            gx = goal_position.get('x', 0.0)
-            gy = goal_position.get('y', 0.0)
-            self.sub_goal = np.array([gx, gy])
-            self.logger.info(f"Goal position: x={gx:.2f}, y={gy:.2f}")
-            
-            # Add closing delimiter
-            self.logger.info(f"FRAME {self.frame_count} COMPLETED")
-            self.logger.info(f"{frame_delimiter}")
-                
-        except Exception as e:
-            import traceback
-            self.logger.error(f"Error processing data: {e}")
-            self.logger.error(traceback.format_exc())
-            
-            # Send a safe stop command in case of error
-            self._send_cmd_vel(0.0, 0.0)
-    
-if __name__ == "__main__":
-    nav2py.main(nav2py_drl_vo_controller)
-    
+
+def build_argument_parser():
+    """Create the inference-process CLI parser."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=0)
+    parser.add_argument('--model-file', required=True)
+    parser.add_argument('--range-limit', type=float, default=30.0)
+    parser.add_argument('--vx-limit', type=float, default=0.5)
+    parser.add_argument('--wz-limit', type=float, default=0.7)
+    parser.add_argument('--min-obstacle-distance', type=float, default=0.45)
+    return parser
+
+
+def main(argv=None):
+    """Start the loopback inference server."""
+    logging.basicConfig(level=logging.INFO)
+    arguments = build_argument_parser().parse_args(argv)
+    controller = DrlVoControllerProcess(
+        host=arguments.host,
+        port=arguments.port,
+        model_file=arguments.model_file,
+        range_limit=arguments.range_limit,
+        vx_limit=arguments.vx_limit,
+        wz_limit=arguments.wz_limit,
+        min_obstacle_distance=arguments.min_obstacle_distance,
+    )
+    try:
+        controller.serve()
+    except (ConnectionError, KeyboardInterrupt):
+        pass
+    finally:
+        controller.cleanup()
+
+
+if __name__ == '__main__':
+    main()

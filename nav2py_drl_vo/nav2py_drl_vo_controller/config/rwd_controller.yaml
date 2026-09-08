@@ -1,0 +1,39 @@
+controller_server:
+  ros__parameters:
+    # This overlay expects the rendered RWD base profile to run the controller
+    # server at 10 Hz, matching the released ROS 1 observation/inference loop.
+    # MPPI model_dt must be 0.1 s when it shares that controller server.
+    FollowPath:
+      # Preserve RWD's final-orientation behavior while replacing only the
+      # primary local controller used for path tracking.
+      plugin: nav2_rotation_shim_controller::RotationShimController
+      primary_controller: nav2py_drl_vo_controller::DrlVoController
+      angular_dist_threshold: 0.4
+      angular_disengage_threshold: 0.15
+      forward_sampling_distance: 0.5
+      rotate_to_heading_angular_vel: 0.5
+      max_angular_accel: 3.2
+      simulate_ahead_time: 1.0
+      rotate_to_goal_heading: true
+
+      # The released policy was trained with a 2 m robot-frame subgoal, ten
+      # 720-value scans over 240 degrees, a 30 m scan scale, and a two-channel
+      # 80x80 pedestrian velocity raster.
+      lookahead_dist: 1.0
+      scan_topic: /scan
+      scan_timeout: 0.5
+      range_limit: 30.0
+      model_scan_angle_min: -2.09439510239
+      model_scan_angle_max: 2.09439510239
+      pedestrian_map_topic: /drl_vo/pedestrian_velocity_map
+      pedestrian_timeout: 0.5
+      require_pedestrian_data: true
+
+      # The Python policy runs behind a loopback socket. Timeout, output clamps,
+      # and a local-costmap footprint rollout make controller failure fail closed.
+      command_timeout: 0.2
+      max_linear_speed: 0.8
+      max_angular_speed: 0.7
+      min_obstacle_distance: 0.45
+      collision_check_horizon: 1.0
+      collision_check_step: 0.05

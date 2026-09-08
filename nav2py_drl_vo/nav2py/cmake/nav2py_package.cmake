@@ -1,6 +1,6 @@
 function(nav2py_package package)
   find_package(nav2_common REQUIRED)
-  find_package(ament_cmake_venv_uv REQUIRED)
+  find_package(ament_cmake_venv REQUIRED)
 
   nav2_package()
 

@@ -1,0 +1,5 @@
+.test_venv/
+**/__pycache__/
+nav2py_drl_vo/build/
+nav2py_drl_vo/install/
+nav2py_drl_vo/log/
