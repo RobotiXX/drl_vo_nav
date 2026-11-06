@@ -58,6 +58,21 @@ def test_action_is_scaled_to_forward_only_velocity_limits():
     assert angular_z == pytest.approx(-0.4)
 
 
+def test_model_device_is_forwarded_to_checkpoint_loader(monkeypatch, tmp_path):
+    checkpoint = tmp_path / 'policy.zip'
+    checkpoint.write_bytes(b'test')
+    loaded = {}
+
+    def fake_load(model_file, model_device):
+        loaded['path'] = model_file
+        loaded['device'] = model_device
+        return _FakeModel()
+
+    monkeypatch.setattr(DrlVoPlanner, '_load_model', staticmethod(fake_load))
+    DrlVoPlanner(model_file=checkpoint, model_device='cuda')
+    assert loaded == {'path': checkpoint, 'device': 'cuda'}
+
+
 def test_close_forward_obstacle_commands_a_stop_without_inference():
     model = _FakeModel(action=(1.0, 1.0))
     planner = DrlVoPlanner(model=model)

@@ -37,6 +37,8 @@ add_custom_command(
   COMMAND "${venv_python}" -c "import torch; print('Using platform PyTorch', torch.__version__)"
   COMMAND "${venv_python}" -m pip install --disable-pip-version-check --no-deps
     -r "${CMAKE_CURRENT_SOURCE_DIR}/requirements-runtime.txt"
+  COMMAND "${venv_python}" -c
+    "import cloudpickle, gym, matplotlib, pandas, stable_baselines3, yaml; print('DRL-VO Python runtime dependencies are importable')"
   COMMAND "${CMAKE_COMMAND}" -E touch "${venv_dir}/.drl_vo_runtime_ready"
   VERBATIM
 )

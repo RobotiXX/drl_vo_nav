@@ -181,6 +181,12 @@ actual policy-command rate. MPPI profiles use `model_dt: 0.1`; their
 does not double their prediction horizons. The velocity smoother can continue
 publishing between controller updates at 20 Hz.
 
+The policy device is configurable. `model_device: auto` selects CUDA when the
+installed PyTorch runtime exposes it and otherwise falls back to CPU. Freeze it
+to `cuda` or `cpu` when a study condition requires an explicit device; always
+measure checkpoint warmup and sustained inference on the deployment machine
+against `command_timeout` and the controller period.
+
 ## Controller parameters
 
 The RWD profile is
@@ -197,6 +203,7 @@ are:
 - `min_obstacle_distance`: forward lidar emergency-stop threshold.
 - `collision_check_horizon` and `collision_check_step`: local-costmap rollout.
 - `command_timeout`: maximum synchronous Python inference wait.
+- `model_device`: Stable-Baselines3 inference device (`auto`, `cpu`, or a CUDA device accepted by PyTorch).
 
 ## Tests
 

@@ -136,6 +136,7 @@ void DrlVoController::configure(
   declare("require_pedestrian_data", true);
   declare("command_timeout", 0.2);
   declare("model_file", std::string());
+  declare("model_device", std::string("auto"));
   declare("range_limit", 30.0);
   declare("model_scan_angle_min", -2.09439510239);
   declare("model_scan_angle_max", 2.09439510239);
@@ -157,6 +158,7 @@ void DrlVoController::configure(
   node->get_parameter(plugin_name_ + ".require_pedestrian_data", require_pedestrian_data_);
   node->get_parameter(plugin_name_ + ".command_timeout", command_timeout_seconds_);
   node->get_parameter(plugin_name_ + ".model_file", model_file);
+  node->get_parameter(plugin_name_ + ".model_device", model_device_);
   node->get_parameter(plugin_name_ + ".range_limit", range_limit_);
   node->get_parameter(plugin_name_ + ".model_scan_angle_min", model_scan_angle_min_);
   node->get_parameter(plugin_name_ + ".model_scan_angle_max", model_scan_angle_max_);
@@ -173,6 +175,9 @@ void DrlVoController::configure(
   {
     throw nav2_core::PlannerException("DRL-VO controller parameters must be positive");
   }
+  if (model_device_.empty()) {
+    throw nav2_core::PlannerException("DRL-VO model_device cannot be empty");
+  }
   active_linear_speed_limit_ = max_linear_speed_;
   pedestrian_map_.assign(kPedestrianMapSize, 0.0F);
 
@@ -185,6 +190,7 @@ void DrlVoController::configure(
   std::ostringstream command;
   command << shell_quote(executable) << " --host 127.0.0.1 --port 0"
           << " --model-file " << shell_quote(model_file)
+          << " --model-device " << shell_quote(model_device_)
           << " --range-limit " << range_limit_
           << " --vx-limit " << max_linear_speed_
           << " --wz-limit " << max_angular_speed_

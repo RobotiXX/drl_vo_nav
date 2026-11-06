@@ -22,6 +22,7 @@ class DrlVoControllerProcess(nav2py.interfaces.nav2py_costmap_controller):
         self,
         *args,
         model_file,
+        model_device,
         range_limit,
         vx_limit,
         wz_limit,
@@ -30,7 +31,10 @@ class DrlVoControllerProcess(nav2py.interfaces.nav2py_costmap_controller):
     ):
         super().__init__(*args, **kwargs)
         self.logger = logging.getLogger('nav2py_drl_vo_controller')
-        self.planner = DrlVoPlanner(model_file=model_file)
+        self.planner = DrlVoPlanner(
+            model_file=model_file,
+            model_device=model_device,
+        )
         self.planner.configure(
             range_limit=range_limit,
             vx_limit=vx_limit,
@@ -107,6 +111,7 @@ def build_argument_parser():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=0)
     parser.add_argument('--model-file', required=True)
+    parser.add_argument('--model-device', default='auto')
     parser.add_argument('--range-limit', type=float, default=30.0)
     parser.add_argument('--vx-limit', type=float, default=0.5)
     parser.add_argument('--wz-limit', type=float, default=0.7)
@@ -122,6 +127,7 @@ def main(argv=None):
         host=arguments.host,
         port=arguments.port,
         model_file=arguments.model_file,
+        model_device=arguments.model_device,
         range_limit=arguments.range_limit,
         vx_limit=arguments.vx_limit,
         wz_limit=arguments.wz_limit,

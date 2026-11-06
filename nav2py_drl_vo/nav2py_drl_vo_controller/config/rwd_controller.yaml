@@ -31,6 +31,9 @@ controller_server:
 
       # The Python policy runs behind a loopback socket. Timeout, output clamps,
       # and a local-costmap footprint rollout make controller failure fail closed.
+      # `auto` uses CUDA when the PyTorch runtime exposes it and otherwise uses
+      # CPU. Set this explicitly to cpu or cuda for a frozen experiment profile.
+      model_device: auto
       command_timeout: 0.2
       max_linear_speed: 0.8
       max_angular_speed: 0.7

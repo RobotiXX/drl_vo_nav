@@ -48,20 +48,20 @@ def decode_numeric_array(messages, expected_size, name):
 class DrlVoPlanner:
     """Load the DRL-VO policy and convert ROS-facing arrays into observations."""
 
-    def __init__(self, model_file=None, model=None):
+    def __init__(self, model_file=None, model=None, model_device='auto'):
         if model is not None:
             self.model = model
         else:
             if not model_file:
                 raise DrlVoInputError('model_file is required')
-            self.model = self._load_model(Path(model_file))
+            self.model = self._load_model(Path(model_file), model_device)
         self.range_limit = 30.0
         self.vx_limit = 0.5
         self.wz_limit = 0.7
         self.min_obstacle_distance = 0.45
 
     @staticmethod
-    def _load_model(model_file):
+    def _load_model(model_file, model_device):
         if not model_file.is_file():
             raise DrlVoInputError(f'DRL-VO checkpoint does not exist: {model_file}')
 
@@ -71,7 +71,7 @@ class DrlVoPlanner:
         sys.modules.setdefault('custom_cnn_full', custom_cnn_full)
         from stable_baselines3 import PPO
 
-        return PPO.load(str(model_file), device='cpu')
+        return PPO.load(str(model_file), device=model_device)
 
     def configure(
         self,

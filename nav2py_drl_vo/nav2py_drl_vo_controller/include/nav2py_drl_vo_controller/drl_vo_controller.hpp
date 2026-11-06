@@ -77,6 +77,7 @@ protected:
   rclcpp::Logger logger_{rclcpp::get_logger("DrlVoController")};
   rclcpp::Clock::SharedPtr clock_;
   std::string plugin_name_;
+  std::string model_device_{"auto"};
 
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>>
   global_plan_publisher_;
